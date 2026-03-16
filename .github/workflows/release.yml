@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build cntx-rs
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-unknown-linux-gnu
+
+      - name: Install Linux build dependencies
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            SUDO=""
+          fi
+
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p dist
+          cp "target/x86_64-unknown-linux-gnu/release/cntx-rs" "dist/cntx-rs"
+
+      - name: Compute SHA256
+        run: |
+          if command -v shasum >/dev/null 2>&1; then
+            SHA="$(shasum -a 256 "dist/cntx-rs" | awk '{print $1}')"
+          else
+            SHA="$(sha256sum "dist/cntx-rs" | awk '{print $1}')"
+          fi
+
+          printf '%s  %s\n' "$SHA" "cntx-rs" > "dist/cntx-rs.sha256"
+
+      - uses: actions/upload-artifact@v8
+        with:
+          name: github-release-assets
+          path: dist/*
+
+  github-release:
+    name: Create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          {
+            echo "## Install"
+            echo
+            echo "Download \`cntx-rs\` and \`cntx-rs.sha256\` from the assets below."
+            echo
+            echo "Verify the checksum, make the binary executable, and run:"
+            echo
+            echo '```bash'
+            echo "sha256sum -c cntx-rs.sha256"
+            echo "chmod +x cntx-rs"
+            echo "./cntx-rs install"
+            echo '```'
+            echo
+            echo "Or install directly from the tagged source:"
+            echo
+            echo '```bash'
+            echo "cargo install --git https://github.com/${GITHUB_REPOSITORY}.git --tag ${TAG} cntx-rs"
+            echo '```'
+            echo
+            echo "## Checksums (SHA256)"
+            echo
+            echo '```text'
+            cat artifacts/*.sha256
+            echo '```'
+          } > body.md
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" artifacts/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+            gh release edit "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file body.md
+          else
+            gh release create "${GITHUB_REF_NAME}" artifacts/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file body.md \
+              --draft
+          fi

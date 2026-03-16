@@ -1,0 +1,8 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+  "name": "Rust",
+  "image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
+  "features": {},
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y cmake bubblewrap libdbus-1-dev pkg-config",
+}
