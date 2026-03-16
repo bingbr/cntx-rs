@@ -63,7 +63,7 @@ jobs:
 
           printf '%s  %s\n' "$SHA" "cntx-rs" > "dist/cntx-rs.sha256"
 
-      - uses: actions/upload-artifact@v8
+      - uses: actions/upload-artifact@v7
         with:
           name: github-release-assets
           path: dist/*
