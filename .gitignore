@@ -2,3 +2,4 @@ target
 .act-artifacts/
 .env
 .secrets
+.DS_Store
