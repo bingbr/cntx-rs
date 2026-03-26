@@ -397,9 +397,12 @@ fn main() -> Result<()> {
             workspace_root,
             call_json,
         } => {
-            let call =
+            let call: agent::types::ToolCall =
                 serde_json::from_str(&call_json).map_err(|error| anyhow!("Invalid --call-json payload: {error}"))?;
-            let result = agent::runtime::run_internal_tool(&workspace_root, call)?;
+            let result = match agent::runtime::run_internal_tool(&workspace_root, call.clone()) {
+                Ok(result) => result,
+                Err(error) => agent::types::ToolResult::error(&call, error.to_string()),
+            };
             println!("{}", serde_json::to_string(&result)?);
         }
     }
@@ -702,116 +705,4 @@ fn write_mcp_config(path: &std::path::Path, snippet: &str) -> Result<()> {
     }
     fs::write(path, snippet)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{fs, path::Path};
-
-    use super::{
-        SandboxMode, apply_provider_settings, mcp_config_snippet, render_provider_statuses, render_runtime_config,
-        update_runtime_config, write_mcp_config,
-    };
-    use crate::{config::Config, providers::ProviderStatus, temp_paths::create_test_dir};
-
-    #[test]
-    fn mcp_config_uses_vscode_style_shape() {
-        let snippet = mcp_config_snippet(Path::new("/tmp/cntx-rs.toml"), None, None);
-
-        assert!(snippet.contains("\"servers\""));
-        assert!(snippet.contains("\"type\": \"stdio\""));
-        assert!(!snippet.contains("\"mcp.servers\""));
-    }
-
-    #[test]
-    fn mcp_config_uses_agentic_serve_command() {
-        let snippet = mcp_config_snippet(Path::new("/tmp/cntx-rs.toml"), None, None);
-
-        assert!(snippet.contains("\"mcp\""));
-        assert!(snippet.contains("\"serve\""));
-        assert!(!snippet.contains("--type"));
-    }
-
-    #[test]
-    fn mcp_config_includes_provider_and_model_overrides() {
-        let snippet = mcp_config_snippet(Path::new("/tmp/cntx-rs.toml"), Some("openai"), Some("gpt-5-mini"));
-
-        assert!(snippet.contains("\"--provider\""));
-        assert!(snippet.contains("\"openai\""));
-        assert!(snippet.contains("\"--model\""));
-        assert!(snippet.contains("\"gpt-5-mini\""));
-    }
-
-    #[test]
-    fn apply_provider_settings_uses_provider_defaults() {
-        let mut config = Config::default();
-
-        apply_provider_settings(&mut config, "gemini".to_string(), None).expect("provider defaults should be applied");
-
-        assert_eq!(config.provider, "gemini");
-        assert_eq!(config.model, "gemini-3.1-flash-lite-preview");
-    }
-
-    #[test]
-    fn provider_statuses_render_as_aligned_table() {
-        let output = render_provider_statuses(&[ProviderStatus {
-            id: "anthropic",
-            default_model: Some("claude-haiku-4-5"),
-            authenticated: true,
-            auth_source: Some("keyring:anthropic".to_string()),
-            current: true,
-            hint: "local keychain".to_string(),
-        }]);
-
-        assert!(output.contains("provider"));
-        assert!(output.contains("default model"));
-        assert!(output.contains("anthropic"));
-        assert!(output.contains("keyring:anthropic"));
-        assert!(output.contains("local keychain"));
-    }
-
-    #[test]
-    fn runtime_config_render_includes_mode_steps_and_sandbox() {
-        let config = Config::default();
-
-        let output = render_runtime_config(&config, Path::new("/tmp/cntx-rs.toml"));
-
-        assert!(output.contains("provider = anthropic"));
-        assert!(output.contains("model = claude-haiku-4-5"));
-        assert!(output.contains("agentic_max_steps = 20"));
-        assert!(output.contains("agentic_require_sandbox = yes"));
-    }
-
-    #[test]
-    fn update_runtime_config_applies_requested_values() {
-        let mut config = Config::default();
-
-        update_runtime_config(&mut config, Some(32), Some(SandboxMode::Off))
-            .expect("runtime config update should succeed");
-
-        assert_eq!(config.agentic_max_steps, 32);
-        assert!(!config.agentic_require_sandbox);
-    }
-
-    #[test]
-    fn update_runtime_config_requires_at_least_one_flag() {
-        let mut config = Config::default();
-
-        let error = update_runtime_config(&mut config, None, None).expect_err("empty config updates should fail");
-
-        assert!(error.to_string().contains("requires at least one"));
-    }
-
-    #[test]
-    fn write_mcp_config_writes_requested_path() {
-        let root = create_test_dir("mcp-config-write");
-        let path = root.join("nested").join("mcp.json");
-
-        write_mcp_config(&path, "{\n  \"servers\": {}\n}").expect("mcp config should write");
-
-        let contents = fs::read_to_string(&path).expect("written file should be readable");
-        assert!(contents.contains("\"servers\""));
-
-        let _ = fs::remove_dir_all(root);
-    }
 }

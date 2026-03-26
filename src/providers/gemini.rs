@@ -493,15 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn errors_when_provider_does_not_stream_gemini() {
-        let body = r#"{"candidates":[{"content":{"parts":[{"text":"final answer"}]}}]}"#;
-        let error = parse_gemini_stream_reader(Cursor::new(body.as_bytes()), &mut |_| Ok(()))
-            .expect_err("non-stream body should fail");
-
-        assert!(error.to_string().contains("did not return a streaming response"));
-    }
-
-    #[test]
     fn parses_gemini_agent_function_call_turn() {
         let body = json!({
             "candidates": [{

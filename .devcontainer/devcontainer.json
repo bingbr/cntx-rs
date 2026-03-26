@@ -4,5 +4,5 @@
   "name": "Rust",
   "image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
   "features": {},
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y cmake bubblewrap libdbus-1-dev pkg-config",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y cmake bubblewrap libdbus-1-dev pkg-config"
 }

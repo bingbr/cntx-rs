@@ -1,6 +1,6 @@
 [package]
 name = "cntx-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A local-first Rust CLI and stdio MCP server for asking grounded questions over code and docs."
 license = "GPL-3.0-only"

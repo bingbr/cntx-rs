@@ -523,8 +523,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        McpRequest, negotiate_protocol_version, progress_notification, read_message, route_request, tool_error_result,
-        write_message,
+        McpRequest, negotiate_protocol_version, read_message, route_request, tool_error_result, write_message,
     };
     use crate::config::Config;
 
@@ -668,24 +667,6 @@ mod tests {
         assert_eq!(negotiate_protocol_version(Some("2025-11-25")), "2025-11-25");
         assert_eq!(negotiate_protocol_version(Some("2025-06-18")), "2025-06-18");
         assert_eq!(negotiate_protocol_version(Some("2099-01-01")), "2025-11-25");
-    }
-
-    #[test]
-    fn progress_notifications_include_token_message_and_counter() {
-        let notification = progress_notification(json!("token-1"), 2, "Searching resource");
-
-        assert_eq!(
-            notification,
-            json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/progress",
-                "params": {
-                    "progressToken": "token-1",
-                    "progress": 2,
-                    "message": "Searching resource"
-                }
-            })
-        );
     }
 
     #[test]

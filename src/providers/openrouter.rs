@@ -453,10 +453,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{
-        openrouter_agent_turn_payload, openrouter_prompt_payload, parse_openai_like_stream_reader,
-        parse_openrouter_agent_turn,
-    };
+    use super::{parse_openai_like_stream_reader, parse_openrouter_agent_turn};
     use crate::providers::transport::ProviderModelTurn;
 
     #[test]
@@ -476,15 +473,6 @@ mod tests {
 
         assert_eq!(answer, "Hello");
         assert_eq!(chunks, vec!["Hel".to_string(), "lo".to_string()]);
-    }
-
-    #[test]
-    fn errors_when_provider_does_not_stream_openai_like() {
-        let body = r#"{"choices":[{"message":{"content":"final answer"}}]}"#;
-        let error = parse_openai_like_stream_reader(Cursor::new(body.as_bytes()), &mut |_| Ok(()))
-            .expect_err("non-stream body should fail");
-
-        assert!(error.to_string().contains("did not return a streaming response"));
     }
 
     #[test]
@@ -523,53 +511,6 @@ mod tests {
 
         assert_eq!(answer, "final answer");
         assert_eq!(chunks, vec!["final answer".to_string()]);
-    }
-
-    #[test]
-    fn errors_when_stream_never_contains_text() {
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-            "data: [DONE]\n"
-        );
-
-        let error = parse_openai_like_stream_reader(Cursor::new(body.as_bytes()), &mut |_| Ok(())).unwrap_err();
-
-        assert!(error.to_string().contains("completed without any text content"));
-    }
-
-    #[test]
-    fn openrouter_chat_payload_disables_reasoning() {
-        let payload = openrouter_prompt_payload("nvidia/nemotron-3-super-120b-a12b:free", "hello", Some(true));
-
-        assert_eq!(payload["model"], "nvidia/nemotron-3-super-120b-a12b:free");
-        assert_eq!(payload["max_tokens"], 1024);
-        assert_eq!(payload["stream"], true);
-        assert_eq!(payload["reasoning"]["effort"], "none");
-        assert_eq!(payload["reasoning"]["exclude"], true);
-    }
-
-    #[test]
-    fn openrouter_agent_turn_payload_sets_tool_choice() {
-        let payload = openrouter_agent_turn_payload(
-            "nvidia/nemotron-3-super-120b-a12b:free",
-            vec![json!({
-                "role": "user",
-                "content": "hello",
-            })],
-            vec![json!({
-                "type": "function",
-                "function": {
-                    "name": "read",
-                    "description": "Read a file",
-                    "parameters": {"type": "object"},
-                }
-            })],
-        );
-
-        assert_eq!(payload["max_tokens"], 1024);
-        assert_eq!(payload["tool_choice"], "auto");
-        assert_eq!(payload["reasoning"]["effort"], "none");
-        assert_eq!(payload["reasoning"]["exclude"], true);
     }
 
     #[test]

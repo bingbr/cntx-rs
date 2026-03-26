@@ -3,7 +3,6 @@ use std::{
     fs,
     ops::ControlFlow,
     path::{Component, Path, PathBuf},
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -25,7 +24,6 @@ const MAX_GLOB_MATCHES: usize = 100;
 const MAX_TREE_ENTRIES: usize = 400;
 const MAX_TREE_DEPTH: usize = 8;
 const MAX_READ_MANY_FILES: usize = 20;
-const MAX_GIT_LOG_ENTRIES: usize = 100;
 
 #[derive(Debug, Deserialize)]
 struct ListInput {
@@ -98,32 +96,8 @@ struct NameSearchInput {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-struct GitDiffInput {
-    rev_a: String,
-    #[serde(default)]
-    rev_b: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitShowInput {
-    rev: String,
-    #[serde(default)]
-    path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitLogInput {
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
 pub fn tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+    let mut defs = vec![
         ToolDefinition {
             name: ToolName::List,
             description: "List files and directories under a workspace path.",
@@ -258,55 +232,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["name"]
             }),
         },
-        ToolDefinition {
-            name: ToolName::GitStatusReadonly,
-            description: "Read the current git status for the prepared workspace.",
-            safe_to_parallelize: false,
-            input_schema: json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: ToolName::GitDiff,
-            description: "Read a git diff between two revisions, optionally restricted to one path.",
-            safe_to_parallelize: false,
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "rev_a": { "type": "string" },
-                    "rev_b": { "type": "string" },
-                    "path": { "type": "string" }
-                },
-                "required": ["rev_a"]
-            }),
-        },
-        ToolDefinition {
-            name: ToolName::GitShow,
-            description: "Read a git object or revision, optionally restricted to one path.",
-            safe_to_parallelize: false,
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "rev": { "type": "string" },
-                    "path": { "type": "string" }
-                },
-                "required": ["rev"]
-            }),
-        },
-        ToolDefinition {
-            name: ToolName::GitLog,
-            description: "Read recent git history for the workspace or one path.",
-            safe_to_parallelize: false,
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_GIT_LOG_ENTRIES }
-                }
-            }),
-        },
-    ]
+    ];
+    defs.extend(super::git::git_tool_definitions());
+    defs
 }
 
 pub fn execute_tool(workspace: &AgentWorkspace, call: &ToolCall) -> Result<ToolResult> {
@@ -321,10 +249,9 @@ pub fn execute_tool(workspace: &AgentWorkspace, call: &ToolCall) -> Result<ToolR
         ToolName::Search => search(workspace, parse_input::<SearchInput>(call)?, started),
         ToolName::Stat => stat_path(workspace, parse_input::<StatInput>(call)?, started),
         ToolName::FindReferences => find_references(workspace, parse_input::<NameSearchInput>(call)?, started),
-        ToolName::GitStatusReadonly => git_status_readonly(workspace, started),
-        ToolName::GitDiff => git_diff(workspace, parse_input::<GitDiffInput>(call)?, started),
-        ToolName::GitShow => git_show(workspace, parse_input::<GitShowInput>(call)?, started),
-        ToolName::GitLog => git_log(workspace, parse_input::<GitLogInput>(call)?, started),
+        ToolName::GitStatusReadonly | ToolName::GitDiff | ToolName::GitShow | ToolName::GitLog => {
+            super::git::execute_git_tool(workspace, call, started)
+        }
     }?;
 
     Ok(ToolResult {
@@ -337,13 +264,13 @@ pub fn execute_tool(workspace: &AgentWorkspace, call: &ToolCall) -> Result<ToolR
     })
 }
 
-struct ToolExecution {
-    output: String,
-    truncated: bool,
-    citations: Vec<ToolCitation>,
+pub(super) struct ToolExecution {
+    pub(super) output: String,
+    pub(super) truncated: bool,
+    pub(super) citations: Vec<ToolCitation>,
 }
 
-fn finish_tool(output: String, citations: Vec<ToolCitation>, truncated: bool) -> ToolExecution {
+pub(super) fn finish_tool(output: String, citations: Vec<ToolCitation>, truncated: bool) -> ToolExecution {
     let (output, output_truncated) = truncate_output(output);
     ToolExecution {
         output,
@@ -605,56 +532,8 @@ fn find_references(workspace: &AgentWorkspace, input: NameSearchInput, started: 
     )
 }
 
-fn git_status_readonly(workspace: &AgentWorkspace, started: Instant) -> Result<ToolExecution> {
-    check_timeout(started)?;
-    let output = run_git_readonly(workspace, &["status", "--short", "--branch"])?;
-    Ok(finish_tool(output, Vec::new(), false))
-}
-
-fn git_diff(workspace: &AgentWorkspace, input: GitDiffInput, started: Instant) -> Result<ToolExecution> {
-    check_timeout(started)?;
-    let mut args = vec!["diff", "--no-ext-diff"];
-    args.push(input.rev_a.as_str());
-    if let Some(rev_b) = input.rev_b.as_deref() {
-        args.push(rev_b);
-    }
-    if let Some(path) = input.path.as_deref() {
-        validate_git_relative_path(path)?;
-        args.push("--");
-        args.push(path);
-    }
-    let output = run_git_readonly(workspace, &args)?;
-    Ok(finish_tool(output, Vec::new(), false))
-}
-
-fn git_show(workspace: &AgentWorkspace, input: GitShowInput, started: Instant) -> Result<ToolExecution> {
-    check_timeout(started)?;
-    let mut args = vec!["show", "--no-ext-diff", input.rev.as_str()];
-    if let Some(path) = input.path.as_deref() {
-        validate_git_relative_path(path)?;
-        args.push("--");
-        args.push(path);
-    }
-    let output = run_git_readonly(workspace, &args)?;
-    Ok(finish_tool(output, Vec::new(), false))
-}
-
-fn git_log(workspace: &AgentWorkspace, input: GitLogInput, started: Instant) -> Result<ToolExecution> {
-    check_timeout(started)?;
-    let limit = input.limit.unwrap_or(20).clamp(1, MAX_GIT_LOG_ENTRIES);
-    let limit_string = limit.to_string();
-    let mut args = vec!["log", "--oneline", "--decorate", "-n", limit_string.as_str()];
-    if let Some(path) = input.path.as_deref() {
-        validate_git_relative_path(path)?;
-        args.push("--");
-        args.push(path);
-    }
-    let output = run_git_readonly(workspace, &args)?;
-    Ok(finish_tool(output, Vec::new(), false))
-}
-
 fn build_optional_glob_matcher(pattern: Option<&str>) -> Result<Option<globset::GlobSet>> {
-    let Some(pattern) = pattern.map(str::trim).filter(|pattern| !pattern.is_empty()) else {
+    let Some(pattern) = pattern.map(str::trim).filter(|p| !p.is_empty()) else {
         return Ok(None);
     };
 
@@ -723,33 +602,6 @@ fn search_lines(
     Ok(finish_tool(output, citations, false))
 }
 
-fn run_git_readonly(workspace: &AgentWorkspace, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&workspace.root)
-        .args(args)
-        .output()
-        .with_context(|| "Starting git for read-only inspection")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("exit status {}", output.status)
-        };
-        bail!("git inspection failed: {detail}");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn validate_git_relative_path(raw: &str) -> Result<()> {
-    let _ = validate_relative_path(raw)?;
-    Ok(())
-}
-
 struct TreeRenderer<'a> {
     workspace: &'a AgentWorkspace,
     max_depth: usize,
@@ -804,7 +656,7 @@ impl TreeRenderer<'_> {
     }
 }
 
-fn parse_input<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> Result<T> {
+pub(super) fn parse_input<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> Result<T> {
     serde_json::from_value(call.input.clone()).with_context(|| format!("Invalid '{}' tool input", call.tool.as_str()))
 }
 
@@ -820,7 +672,7 @@ fn resolve_existing_path(workspace: &AgentWorkspace, raw: &str) -> Result<PathBu
     Ok(canonical)
 }
 
-fn validate_relative_path(raw: &str) -> Result<&Path> {
+pub(super) fn validate_relative_path(raw: &str) -> Result<&Path> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         bail!("path must not be empty");
@@ -927,7 +779,7 @@ fn truncate_output(mut output: String) -> (String, bool) {
     (output, true)
 }
 
-fn check_timeout(started: Instant) -> Result<()> {
+pub(super) fn check_timeout(started: Instant) -> Result<()> {
     if started.elapsed() > TOOL_TIMEOUT {
         bail!("tool execution timed out after {}s", TOOL_TIMEOUT.as_secs());
     }

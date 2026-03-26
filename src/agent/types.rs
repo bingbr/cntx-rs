@@ -129,6 +129,19 @@ pub struct ToolResult {
     pub citations: Vec<ToolCitation>,
 }
 
+impl ToolResult {
+    pub fn error(call: &ToolCall, error: impl Into<String>) -> Self {
+        Self {
+            id: call.id.clone(),
+            tool: call.tool,
+            output: format!("tool execution failed for `{}`: {}", call.tool, error.into().trim()),
+            citations: Vec::new(),
+            truncated: false,
+            is_error: true,
+        }
+    }
+}
+
 pub trait ToolExecutor: Send + Sync {
     fn execute(&self, workspace: &AgentWorkspace, call: &ToolCall) -> Result<ToolResult>;
 }

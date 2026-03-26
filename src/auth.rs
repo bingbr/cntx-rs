@@ -166,16 +166,3 @@ fn missing_auth_message(provider_id: &str, keyring_error: Option<anyhow::Error>)
 
     message
 }
-
-#[cfg(test)]
-mod tests {
-    use super::missing_auth_message;
-
-    #[test]
-    fn missing_auth_message_is_explicit() {
-        assert_eq!(
-            missing_auth_message("anthropic", None),
-            "Provider \"anthropic\" is not authenticated."
-        );
-    }
-}

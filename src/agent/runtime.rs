@@ -1,27 +1,20 @@
-use std::{
-    any::Any,
-    collections::HashSet,
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    thread,
-};
+use std::{any::Any, collections::HashSet, path::Path, thread};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::{
+    sandbox::ToolExecutorImpl,
     tools,
     types::{
         AgentItem, AgentRunOutput, AgentRunStatus, AgentRuntimeEvent, AgentWorkspace, ToolCall, ToolDefinition,
-        ToolExecutor, ToolName, ToolResult, WorkspaceResourceSummary, profile_id_for_provider, resolve_profile,
+        ToolExecutor, ToolName, ToolResult, profile_id_for_provider, resolve_profile,
     },
+    workspace,
 };
 use crate::{
     ask::{AskOutput, Citation, ResourceSummary, RetrievalSummary},
     config::Config,
-    providers,
-    resources::{self, ResolvedResource},
-    temp_paths, validation,
+    providers, resources, validation,
 };
 
 type ChunkCallback<'a> = dyn FnMut(&str) -> Result<()> + 'a;
@@ -41,7 +34,7 @@ pub fn ask_question(
     let question = validation::validate_question(question)?;
     let resolved_resources = resources::resolve_resource_references(&config.resources, requested_resources, &question)?;
     let prepared_workspace =
-        prepare_workspace_from_resources(&config.data_dir, &resolved_resources, on_progress.as_deref_mut())?;
+        workspace::prepare_workspace_from_resources(&config.data_dir, &resolved_resources, on_progress.as_deref_mut())?;
     let workspace = prepared_workspace.workspace();
     let user_prompt = build_user_prompt(workspace, &question);
     let adapter = providers::build_adapter(&config.provider)?;
@@ -63,11 +56,7 @@ pub fn ask_question(
     session.model = config.model.clone();
     session.conversation = vec![AgentItem::UserText(user_prompt)];
     let tool_definitions = tools::tool_definitions();
-    let executor = if config.agentic_require_sandbox {
-        ToolExecutorImpl::Bubblewrap(BubblewrapToolExecutor::from_config(&config)?)
-    } else {
-        ToolExecutorImpl::Local
-    };
+    let executor = ToolExecutorImpl::from_config(&config)?;
     let output = run_agent_loop(
         adapter.as_ref(),
         &executor,
@@ -77,6 +66,7 @@ pub fn ask_question(
             tools: &tool_definitions,
             max_steps: config.agentic_max_steps,
             allow_parallel_tools: selected_profile.parallel_tools,
+            fail_closed_on_executor_error: config.agentic_require_sandbox,
         },
         on_progress.as_deref_mut(),
     )?;
@@ -134,212 +124,11 @@ pub fn run_internal_tool(workspace_root: &Path, call: ToolCall) -> Result<ToolRe
     )
 }
 
-enum ToolExecutorImpl {
-    Local,
-    Bubblewrap(BubblewrapToolExecutor),
-}
-
-struct BubblewrapToolExecutor {
-    bwrap_path: PathBuf,
-    binary_path: PathBuf,
-}
-
-impl BubblewrapToolExecutor {
-    fn from_config(config: &Config) -> Result<Self> {
-        Ok(Self {
-            bwrap_path: config.bwrap_path.clone().unwrap_or_else(|| PathBuf::from("bwrap")),
-            binary_path: std::env::current_exe().with_context(|| "Resolving current cntx-rs binary path")?,
-        })
-    }
-}
-
-impl ToolExecutor for ToolExecutorImpl {
-    fn execute(&self, workspace: &AgentWorkspace, call: &ToolCall) -> Result<ToolResult> {
-        match self {
-            Self::Local => tools::execute_tool(workspace, call),
-            Self::Bubblewrap(executor) => executor.execute(workspace, call),
-        }
-    }
-}
-
-impl BubblewrapToolExecutor {
-    fn execute(&self, workspace: &AgentWorkspace, call: &ToolCall) -> Result<ToolResult> {
-        let call_json = serde_json::to_string(call)?;
-        let mut command = Command::new(&self.bwrap_path);
-        command.arg("--unshare-all");
-        command.arg("--die-with-parent");
-        command.arg("--new-session");
-
-        for path in ["/usr", "/bin", "/lib", "/lib64", "/etc", "/nix/store"] {
-            if Path::new(path).exists() {
-                command.arg("--ro-bind").arg(path).arg(path);
-            }
-        }
-
-        command
-            .arg("--ro-bind")
-            .arg(&workspace.root)
-            .arg("/workspace")
-            .arg("--ro-bind")
-            .arg(&self.binary_path)
-            .arg("/cntx-rs-bin")
-            .arg("--chdir")
-            .arg("/workspace")
-            .arg("--proc")
-            .arg("/proc")
-            .arg("--dev")
-            .arg("/dev")
-            .arg("--tmpfs")
-            .arg("/tmp")
-            .arg("/cntx-rs-bin")
-            .arg("internal-tool")
-            .arg("--workspace-root")
-            .arg("/workspace")
-            .arg("--call-json")
-            .arg(call_json);
-
-        let output = command.output().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow!(
-                    "bubblewrap is required for agentic mode but '{}' was not found",
-                    self.bwrap_path.display()
-                )
-            } else {
-                anyhow!("failed to start bubblewrap '{}': {error}", self.bwrap_path.display())
-            }
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            };
-            bail!("bubblewrap tool execution failed: {detail}");
-        }
-
-        serde_json::from_slice(&output.stdout).with_context(|| "Parsing sandboxed tool result JSON")
-    }
-}
-
-struct PreparedWorkspace {
-    workspace: AgentWorkspace,
-    _root_guard: WorkspaceRootGuard,
-}
-
-impl PreparedWorkspace {
-    fn workspace(&self) -> &AgentWorkspace {
-        &self.workspace
-    }
-
-    #[cfg(test)]
-    fn root(&self) -> &Path {
-        &self._root_guard.path
-    }
-}
-
-struct WorkspaceRootGuard {
-    path: PathBuf,
-}
-
-impl Drop for WorkspaceRootGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn prepare_workspace_from_resources(
-    data_dir: &Path,
-    resources: &[ResolvedResource],
-    mut on_progress: Option<&mut ProgressCallback<'_>>,
-) -> Result<PreparedWorkspace> {
-    let root = temp_paths::unique_temp_path("cntx-rs-agentic")?;
-    fs::create_dir_all(&root).with_context(|| format!("Creating workspace root '{}'", root.display()))?;
-    let root_guard = WorkspaceRootGuard { path: root.clone() };
-
-    let mut summaries = Vec::new();
-    for resource in resources {
-        if let Some(on_progress) = on_progress.as_mut() {
-            (**on_progress)(&format!("Preparing resource '{}'", resource.name))?;
-        }
-        let source_root =
-            resources::ensure_local_resource_with_progress(resource, data_dir, on_progress.as_deref_mut())?;
-        let resource_mount = root.join(&resource.name);
-        if let Some(on_progress) = on_progress.as_mut() {
-            (**on_progress)(&format!(
-                "Copying resource '{}' into the agent workspace",
-                resource.name
-            ))?;
-        }
-        copy_tree(&source_root, &resource_mount).with_context(|| {
-            format!(
-                "Copying resource '{}' into workspace '{}'",
-                resource.name,
-                resource_mount.display()
-            )
-        })?;
-
-        summaries.push(WorkspaceResourceSummary {
-            name: resource.name.clone(),
-            kind: resource.kind.to_string(),
-            source: resource.source_display(),
-            branch: resource.branch.clone(),
-            search_paths: resource
-                .search_paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect(),
-            notes: resource.notes.clone(),
-            mount_path: resource.name.clone(),
-            ephemeral: resource.ephemeral,
-        });
-    }
-
-    Ok(PreparedWorkspace {
-        workspace: AgentWorkspace {
-            root,
-            resources: summaries,
-        },
-        _root_guard: root_guard,
-    })
-}
-
-fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source).with_context(|| format!("Inspecting '{}'", source.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-
-    if metadata.is_dir() {
-        fs::create_dir_all(destination).with_context(|| format!("Creating directory '{}'", destination.display()))?;
-        for entry in fs::read_dir(source).with_context(|| format!("Reading directory '{}'", source.display()))? {
-            let entry = entry?;
-            let child_source = entry.path();
-            let child_destination = destination.join(entry.file_name());
-            copy_tree(&child_source, &child_destination)?;
-        }
-        return Ok(());
-    }
-
-    if metadata.is_file() {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("Creating directory '{}'", parent.display()))?;
-        }
-        fs::copy(source, destination)
-            .with_context(|| format!("Copying file '{}' to '{}'", source.display(), destination.display()))?;
-    }
-
-    Ok(())
-}
-
 struct AgentLoopConfig<'a> {
     tools: &'a [ToolDefinition],
     max_steps: usize,
     allow_parallel_tools: bool,
+    fail_closed_on_executor_error: bool,
 }
 
 fn run_agent_loop(
@@ -405,7 +194,16 @@ fn run_agent_loop(
                     && calls.len() > 1
                     && calls.iter().all(|call| is_parallel_safe_tool(config.tools, call))
                 {
-                    execute_tool_calls_in_parallel(executor, workspace, &calls)
+                    if config.fail_closed_on_executor_error {
+                        execute_tool_calls_in_parallel_fail_closed(executor, workspace, &calls)?
+                    } else {
+                        execute_tool_calls_in_parallel(executor, workspace, &calls)
+                    }
+                } else if config.fail_closed_on_executor_error {
+                    calls
+                        .iter()
+                        .map(|call| execute_tool_call_fail_closed(executor, workspace, call))
+                        .collect::<Result<Vec<_>>>()?
                 } else {
                     calls
                         .iter()
@@ -467,6 +265,16 @@ fn execute_tool_call(executor: &dyn ToolExecutor, workspace: &AgentWorkspace, ca
         .unwrap_or_else(|error| tool_error_result(call, error.to_string()))
 }
 
+fn execute_tool_call_fail_closed(
+    executor: &dyn ToolExecutor,
+    workspace: &AgentWorkspace,
+    call: &ToolCall,
+) -> Result<ToolResult> {
+    executor
+        .execute(workspace, call)
+        .with_context(|| format!("tool execution aborted for `{}`", call.tool))
+}
+
 fn execute_tool_calls_in_parallel(
     executor: &dyn ToolExecutor,
     workspace: &AgentWorkspace,
@@ -500,6 +308,41 @@ fn execute_tool_calls_in_parallel(
     results.into_iter().map(|(_, result)| result).collect()
 }
 
+fn execute_tool_calls_in_parallel_fail_closed(
+    executor: &dyn ToolExecutor,
+    workspace: &AgentWorkspace,
+    calls: &[ToolCall],
+) -> Result<Vec<ToolResult>> {
+    let mut results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(calls.len());
+
+        for (index, call) in calls.iter().enumerate() {
+            let handle =
+                scope.spawn(move || execute_tool_call_fail_closed_with_panic_handling(executor, workspace, call));
+            handles.push((index, handle));
+        }
+
+        handles
+            .into_iter()
+            .map(|(index, handle)| {
+                let result = match handle.join() {
+                    Ok(result) => result,
+                    Err(panic) => Err(anyhow!(
+                        "tool execution aborted for `{}`: tool execution panicked: {}",
+                        calls[index].tool,
+                        panic_payload_to_string(&*panic)
+                    )),
+                };
+
+                (index, result)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
 fn execute_tool_call_with_panic_handling(
     executor: &dyn ToolExecutor,
     workspace: &AgentWorkspace,
@@ -515,15 +358,23 @@ fn execute_tool_call_with_panic_handling(
     }
 }
 
-fn tool_error_result(call: &ToolCall, error: String) -> ToolResult {
-    ToolResult {
-        id: call.id.clone(),
-        tool: call.tool,
-        output: format!("tool execution failed for `{}`: {}", call.tool, error.trim()),
-        citations: Vec::new(),
-        truncated: false,
-        is_error: true,
+fn execute_tool_call_fail_closed_with_panic_handling(
+    executor: &dyn ToolExecutor,
+    workspace: &AgentWorkspace,
+    call: &ToolCall,
+) -> Result<ToolResult> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.execute(workspace, call))) {
+        Ok(result) => result.with_context(|| format!("tool execution aborted for `{}`", call.tool)),
+        Err(panic) => Err(anyhow!(
+            "tool execution aborted for `{}`: tool execution panicked: {}",
+            call.tool,
+            panic_payload_to_string(&*panic)
+        )),
     }
+}
+
+fn tool_error_result(call: &ToolCall, error: String) -> ToolResult {
+    ToolResult::error(call, error)
 }
 
 fn panic_payload_to_string(payload: &(dyn Any + Send + 'static)) -> String {
@@ -757,163 +608,223 @@ fn build_retrieval_summary(workspace: &AgentWorkspace, output: &AgentRunOutput) 
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::VecDeque, path::PathBuf, sync::Mutex};
 
+    use anyhow::Result;
+    use reqwest::blocking::Client;
     use serde_json::json;
 
-    use super::{
-        BubblewrapToolExecutor, build_partial_answer_prompt, build_retrieval_summary, prepare_workspace_from_resources,
-    };
+    use super::{AgentLoopConfig, run_agent_loop};
     use crate::{
         agent::types::{
-            AgentRunOutput, AgentRunStatus, AgentRuntimeEvent, AgentWorkspace, ToolCall, ToolName, ToolResult,
-            WorkspaceResourceSummary,
+            AgentItem, AgentRunStatus, AgentSession, AgentWorkspace, ProviderCapabilities, ProviderTurn,
+            ProviderTurnRequest, ToolCall, ToolExecutor, ToolName, ToolResult, WorkspaceResourceSummary,
         },
         config::Config,
-        resources::{ResolvedResource, ResourceKind},
-        temp_paths::create_test_dir,
+        providers::{ProviderAdapter, ProviderError, ProviderResult},
     };
 
-    #[test]
-    fn prepared_workspace_cleans_up_on_drop() {
-        let data_dir = create_test_dir("agentic-workspace-data");
-        let repo_root = data_dir.join("local-repo");
-        fs::create_dir_all(&repo_root).expect("create repo");
-        fs::write(repo_root.join("README.md"), "hello").expect("write repo file");
+    struct ScriptedProviderAdapter {
+        capabilities: ProviderCapabilities,
+        turns: Mutex<VecDeque<ProviderTurn>>,
+    }
 
-        let prepared = prepare_workspace_from_resources(
-            &data_dir,
-            &[ResolvedResource {
+    impl ScriptedProviderAdapter {
+        fn new(capabilities: ProviderCapabilities, turns: Vec<ProviderTurn>) -> Self {
+            Self {
+                capabilities,
+                turns: Mutex::new(turns.into()),
+            }
+        }
+    }
+
+    impl ProviderAdapter for ScriptedProviderAdapter {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities
+        }
+
+        fn ask(
+            &self,
+            _client: &Client,
+            _config: &Config,
+            _prompt: &str,
+            _api_key: Option<&str>,
+        ) -> ProviderResult<String> {
+            Err(ProviderError::Protocol("unused in runtime tests".to_string()))
+        }
+
+        fn ask_stream(
+            &self,
+            _client: &Client,
+            _config: &Config,
+            _prompt: &str,
+            _api_key: Option<&str>,
+            _on_chunk: &mut dyn FnMut(&str) -> Result<()>,
+        ) -> ProviderResult<String> {
+            Err(ProviderError::Protocol("unused in runtime tests".to_string()))
+        }
+
+        fn complete_turn(&self, _request: ProviderTurnRequest<'_>) -> ProviderResult<ProviderTurn> {
+            self.turns
+                .lock()
+                .expect("turn queue lock should not be poisoned")
+                .pop_front()
+                .ok_or_else(|| ProviderError::Protocol("no scripted turns remaining".to_string()))
+        }
+    }
+
+    struct AlwaysFailingExecutor;
+
+    impl ToolExecutor for AlwaysFailingExecutor {
+        fn execute(&self, _workspace: &AgentWorkspace, _call: &ToolCall) -> Result<ToolResult> {
+            Err(anyhow::anyhow!("sandbox startup failed"))
+        }
+    }
+
+    fn test_session() -> AgentSession {
+        AgentSession {
+            profile: crate::agent::types::AgentProfileId::Anthropic,
+            provider: "anthropic".to_string(),
+            system_prompt: String::new(),
+            model: "test-model".to_string(),
+            conversation: Vec::new(),
+            provider_state: None,
+        }
+    }
+
+    fn test_workspace() -> AgentWorkspace {
+        AgentWorkspace {
+            root: PathBuf::from("/tmp/workspace"),
+            resources: vec![WorkspaceResourceSummary {
                 name: "repo".to_string(),
-                kind: ResourceKind::Local,
-                git_url: None,
-                local_path: Some(repo_root.clone()),
-                branch: None,
-                search_paths: vec![PathBuf::from(".")],
+                kind: "git".to_string(),
+                source: "https://github.com/example/repo".to_string(),
+                branch: Some("main".to_string()),
+                search_paths: vec!["docs".to_string()],
                 notes: None,
+                mount_path: "repo".to_string(),
                 ephemeral: false,
             }],
+        }
+    }
+
+    fn list_tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool: ToolName::List,
+            input: json!({ "path": "." }),
+            provider_data: None,
+        }
+    }
+
+    #[test]
+    fn run_agent_loop_aborts_when_sandboxed_tool_execution_fails() {
+        let adapter = ScriptedProviderAdapter::new(
+            ProviderCapabilities {
+                supports_streaming: false,
+                supports_parallel_tool_calls: false,
+            },
+            vec![ProviderTurn::ToolCalls {
+                items: vec![AgentItem::AssistantText("Inspecting the workspace.".to_string())],
+                calls: vec![list_tool_call("call-1")],
+                provider_state: None,
+            }],
+        );
+        let tools = crate::agent::tools::tool_definitions();
+
+        let error = run_agent_loop(
+            &adapter,
+            &AlwaysFailingExecutor,
+            &test_workspace(),
+            test_session(),
+            AgentLoopConfig {
+                tools: &tools,
+                max_steps: 2,
+                allow_parallel_tools: false,
+                fail_closed_on_executor_error: true,
+            },
             None,
         )
-        .expect("workspace should build");
+        .expect_err("sandboxed tool failures should abort the agent loop");
 
-        let workspace_root = prepared.root().to_path_buf();
-        assert!(workspace_root.exists());
-        assert!(workspace_root.join("repo/README.md").exists());
-
-        drop(prepared);
-
-        assert!(!workspace_root.exists());
-        let _ = fs::remove_dir_all(data_dir);
+        assert!(error.to_string().contains("tool execution aborted for `list`"));
+        assert!(format!("{error:#}").contains("sandbox startup failed"));
     }
 
     #[test]
-    fn bubblewrap_executor_fails_closed_when_binary_is_missing() {
-        let config = Config {
-            bwrap_path: Some(PathBuf::from("/definitely-missing-bwrap")),
-            ..Config::default()
-        };
-        let executor = BubblewrapToolExecutor::from_config(&config).expect("executor should build");
-        let workspace_root = create_test_dir("agentic-sandbox-missing-bwrap");
-        fs::create_dir_all(workspace_root.join("repo")).expect("create repo dir");
+    fn run_agent_loop_aborts_when_parallel_sandboxed_tool_execution_fails() {
+        let adapter = ScriptedProviderAdapter::new(
+            ProviderCapabilities {
+                supports_streaming: false,
+                supports_parallel_tool_calls: true,
+            },
+            vec![ProviderTurn::ToolCalls {
+                items: vec![AgentItem::AssistantText("Inspecting the workspace.".to_string())],
+                calls: vec![list_tool_call("call-1"), list_tool_call("call-2")],
+                provider_state: None,
+            }],
+        );
+        let tools = crate::agent::tools::tool_definitions();
 
-        let error = executor
-            .execute(
-                &AgentWorkspace {
-                    root: workspace_root.clone(),
-                    resources: Vec::new(),
+        let error = run_agent_loop(
+            &adapter,
+            &AlwaysFailingExecutor,
+            &test_workspace(),
+            test_session(),
+            AgentLoopConfig {
+                tools: &tools,
+                max_steps: 2,
+                allow_parallel_tools: true,
+                fail_closed_on_executor_error: true,
+            },
+            None,
+        )
+        .expect_err("parallel sandboxed tool failures should abort the agent loop");
+
+        assert!(error.to_string().contains("tool execution aborted for `list`"));
+        assert!(format!("{error:#}").contains("sandbox startup failed"));
+    }
+
+    #[test]
+    fn run_agent_loop_keeps_tool_errors_recoverable_when_fail_closed_is_disabled() {
+        let adapter = ScriptedProviderAdapter::new(
+            ProviderCapabilities {
+                supports_streaming: false,
+                supports_parallel_tool_calls: false,
+            },
+            vec![
+                ProviderTurn::ToolCalls {
+                    items: vec![AgentItem::AssistantText("Inspecting the workspace.".to_string())],
+                    calls: vec![list_tool_call("call-1")],
+                    provider_state: None,
                 },
-                &ToolCall {
-                    id: "1".to_string(),
-                    tool: ToolName::List,
-                    input: json!({ "path": "." }),
-                    provider_data: None,
+                ProviderTurn::Final {
+                    text: "done".to_string(),
+                    items: vec![AgentItem::FinalAnswer("done".to_string())],
+                    provider_state: None,
                 },
-            )
-            .expect_err("missing bwrap should fail");
+            ],
+        );
+        let tools = crate::agent::tools::tool_definitions();
 
-        assert!(error.to_string().contains("bubblewrap is required"));
-        let _ = fs::remove_dir_all(workspace_root);
-    }
+        let output = run_agent_loop(
+            &adapter,
+            &AlwaysFailingExecutor,
+            &test_workspace(),
+            test_session(),
+            AgentLoopConfig {
+                tools: &tools,
+                max_steps: 2,
+                allow_parallel_tools: false,
+                fail_closed_on_executor_error: false,
+            },
+            None,
+        )
+        .expect("non-fatal executor errors should be surfaced as tool results");
 
-    #[test]
-    fn partial_answer_prompt_includes_question_thoughts_and_tool_output() {
-        let workspace = AgentWorkspace {
-            root: PathBuf::from("/tmp/workspace"),
-            resources: vec![WorkspaceResourceSummary {
-                name: "repo".to_string(),
-                kind: "git".to_string(),
-                source: "https://github.com/example/repo".to_string(),
-                branch: Some("main".to_string()),
-                search_paths: vec!["docs".to_string()],
-                notes: Some("Prefer docs.".to_string()),
-                mount_path: "repo".to_string(),
-                ephemeral: false,
-            }],
-        };
-        let output = AgentRunOutput {
-            answer: None,
-            events: vec![AgentRuntimeEvent::Thinking(
-                "Searching the docs for state rune details.".to_string(),
-            )],
-            tool_results: vec![ToolResult {
-                id: "call-1".to_string(),
-                tool: ToolName::Read,
-                output: "docs/state.md\n1: $state creates reactive state.".to_string(),
-                is_error: false,
-                truncated: false,
-                citations: Vec::new(),
-            }],
-            steps: 3,
-            status: AgentRunStatus::MaxStepsReached,
-        };
-
-        let prompt = build_partial_answer_prompt(&workspace, "How does $state work?", &output);
-
-        assert!(prompt.contains("How does $state work?"));
-        assert!(prompt.contains("Searching the docs for state rune details."));
-        assert!(prompt.contains("$state creates reactive state."));
-    }
-
-    #[test]
-    fn retrieval_summary_uses_agent_turn_count() {
-        let workspace = AgentWorkspace {
-            root: PathBuf::from("/tmp/workspace"),
-            resources: vec![WorkspaceResourceSummary {
-                name: "repo".to_string(),
-                kind: "git".to_string(),
-                source: "https://github.com/example/repo".to_string(),
-                branch: Some("main".to_string()),
-                search_paths: vec!["docs".to_string()],
-                notes: None,
-                mount_path: "repo".to_string(),
-                ephemeral: false,
-            }],
-        };
-        let output = AgentRunOutput {
-            answer: None,
-            events: vec![AgentRuntimeEvent::Thinking("inspect docs".to_string())],
-            tool_results: vec![ToolResult {
-                id: "call-1".to_string(),
-                tool: ToolName::Read,
-                output: "docs/state.md\n1: $state creates reactive state.".to_string(),
-                is_error: false,
-                truncated: false,
-                citations: vec![crate::agent::types::ToolCitation {
-                    resource: "repo".to_string(),
-                    path: "docs/state.md".to_string(),
-                    line: 1,
-                    score: 9,
-                }],
-            }],
-            steps: 2,
-            status: AgentRunStatus::Completed,
-        };
-
-        let summary = build_retrieval_summary(&workspace, &output);
-
-        assert_eq!(summary.retrieval_steps, 2);
-        assert_eq!(summary.snippet_count, 1);
-        assert!(summary.empty_resources.is_empty());
+        assert_eq!(output.status, AgentRunStatus::Completed);
+        assert_eq!(output.tool_results.len(), 1);
+        assert!(output.tool_results[0].is_error);
+        assert!(output.tool_results[0].output.contains("sandbox startup failed"));
     }
 }

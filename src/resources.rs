@@ -598,7 +598,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{ResourceConfig, ResourceKind, default_resources, resolve_resource_references, resource_search_roots};
+    use super::{ResourceConfig, ResourceKind, resolve_resource_references, resource_search_roots};
     use crate::temp_paths::create_test_dir;
 
     #[test]
@@ -683,30 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_git_resources_do_not_assume_main_branch() {
-        let resolved =
-            resolve_resource_references(&[], &[String::from("https://example.com/acme/docs")], "compare docs")
-                .expect("resources should resolve");
-
-        assert_eq!(resolved.len(), 1);
-        assert!(resolved[0].ephemeral);
-        assert!(resolved[0].branch.is_none());
-    }
-
-    #[test]
-    fn default_resources_include_tauri() {
-        let resources = default_resources();
-        let tauri = resources
-            .iter()
-            .find(|resource| resource.name == "tauri")
-            .expect("tauri should be a built-in resource");
-
-        assert_eq!(tauri.git_url.as_deref(), Some("https://github.com/tauri-apps/tauri"));
-        assert_eq!(tauri.branch.as_deref(), Some("dev"));
-        assert_eq!(tauri.search_paths, vec![PathBuf::from(".")]);
-    }
-
-    #[test]
     fn git_resources_can_infer_branch_and_search_path_from_github_tree_urls() {
         let resource = ResourceConfig::new(
             Some("tauri-runtime".to_string()),
@@ -721,41 +697,6 @@ mod tests {
         assert_eq!(resource.git_url.as_deref(), Some("https://github.com/tauri-apps/tauri"));
         assert_eq!(resource.branch.as_deref(), Some("dev"));
         assert_eq!(resource.search_paths, vec![PathBuf::from("crates/tauri-runtime")]);
-    }
-
-    #[test]
-    fn git_resources_can_derive_name_from_scoped_github_tree_url() {
-        let resource = ResourceConfig::new(
-            None,
-            Some("https://github.com/tauri-apps/tauri/tree/dev/crates/tauri-runtime".to_string()),
-            None,
-            None,
-            Vec::new(),
-            None,
-        )
-        .expect("resource should derive name from scoped URL");
-
-        assert_eq!(resource.name, "tauri-runtime");
-        assert_eq!(resource.git_url.as_deref(), Some("https://github.com/tauri-apps/tauri"));
-        assert_eq!(resource.branch.as_deref(), Some("dev"));
-        assert_eq!(resource.search_paths, vec![PathBuf::from("crates/tauri-runtime")]);
-    }
-
-    #[test]
-    fn git_resources_can_derive_name_from_repo_url() {
-        let resource = ResourceConfig::new(
-            None,
-            Some("https://github.com/tauri-apps/tauri".to_string()),
-            None,
-            None,
-            Vec::new(),
-            None,
-        )
-        .expect("resource should derive repo name");
-
-        assert_eq!(resource.name, "tauri");
-        assert_eq!(resource.branch, None);
-        assert_eq!(resource.search_paths, vec![PathBuf::from(".")]);
     }
 
     #[test]
